@@ -326,6 +326,8 @@ static int erofs_rebuild_write_full_data(struct erofs_inode *inode)
 				erofs_pos(src_sbi,
 					  erofs_inode_dev_baddr(inode));
 			inode->datasource = EROFS_INODE_DATA_SOURCE_REBUILD_BLOB;
+		} else {
+			inode->u.i_blkaddr = EROFS_NULL_ADDR;
 		}
 
 		inode->idata_size = inline_size;
