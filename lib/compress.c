@@ -2496,19 +2496,16 @@ int z_erofs_compress_exit(struct erofs_sb_info *sbi)
 	return 0;
 }
 
-int z_erofs_rebuild_load_metadata(struct erofs_sb_info *dst_sbi,
-				  struct erofs_inode *inode)
+static int z_erofs_rebuild_load_extents(struct erofs_sb_info *dst_sbi,
+		struct erofs_inode *inode, struct list_head *extents)
 {
 	struct erofs_sb_info *sbi = inode->sbi;
 	struct erofs_map_blocks map = {
 		.buf = __EROFS_BUF_INITIALIZER,
 		.m_la = 0,
 	};
-	struct z_erofs_extent_item *ei, *n;
-	erofs_off_t pend = EROFS_NULL_ADDR;
-	bool consecutive = true;
-	LIST_HEAD(extents);
-	int err, device_id = -1;
+	struct z_erofs_extent_item *ei;
+	int err;
 
 	if (sbi->blkszbits != dst_sbi->blkszbits) {
 		erofs_err("filesystem block size mismatch: %d for image %d, target %d",
@@ -2522,7 +2519,7 @@ int z_erofs_rebuild_load_metadata(struct erofs_sb_info *dst_sbi,
 
 		err = erofs_map_blocks(inode, &map, EROFS_GET_BLOCKS_FIEMAP);
 		if (err)
-			goto err_out;
+			goto out;
 
 		mdev = (struct erofs_map_dev) {
 			.m_deviceid = map.m_deviceid,
@@ -2530,23 +2527,21 @@ int z_erofs_rebuild_load_metadata(struct erofs_sb_info *dst_sbi,
 		};
 		err = erofs_map_dev(sbi, &mdev);
 		if (err)
-			goto err_out;
+			goto out;
 
 		raw = (map.m_algorithmformat >= Z_EROFS_COMPRESSION_MAX);
 
 		ei = malloc(sizeof(*ei));
 		if (!ei) {
 			err = -ENOMEM;
-			goto err_out;
+			goto out;
 		}
 
 		if (map.m_flags & __EROFS_MAP_FRAGMENT) {
-			DBG_BUGON(!(inode->z_advise &
-					Z_EROFS_ADVISE_FRAGMENT_PCLUSTER));
+			erofs_err("fragment-backed files are not supported in rebuilds: %s",
+				  inode->i_srcpath);
 			err = -EOPNOTSUPP;
 			goto err_free_ei;
-//			inode->fragment_size = map.m_llen;
-//			DBG_BUGON(inode->fragmentoff != map.m_pa);
 		} else if (map.m_flags & EROFS_MAP_META) {
 			DBG_BUGON(inode->idata_size != map.m_plen);
 			inode->idata = malloc(inode->idata_size);
@@ -2561,8 +2556,8 @@ int z_erofs_rebuild_load_metadata(struct erofs_sb_info *dst_sbi,
 			ei->e = (struct z_erofs_inmem_extent) {
 				.length = map.m_llen,
 				.plen = erofs_blksiz(sbi),
-				.pstart = (pend != EROFS_NULL_ADDR ? pend : 0),
-				.device_id = inode->dev,	/* FIXME! */
+				.pstart = 0,
+				.device_id = 0,
 				.raw = raw,
 				.inlined = true,
 			};
@@ -2575,16 +2570,11 @@ int z_erofs_rebuild_load_metadata(struct erofs_sb_info *dst_sbi,
 				.length = map.m_llen,
 				.plen = map.m_plen,
 				.pstart = mdev.m_pa,
-				.device_id = inode->dev,	/* FIXME! */
+				.device_id = mdev.m_deviceid,
 				.partial = map.m_flags & EROFS_MAP_PARTIAL_REF,
 				.raw = raw,
 				.inlined = false,
 			};
-			if (pend != EROFS_NULL_ADDR && (pend != ei->e.pstart ||
-						device_id != ei->e.device_id))
-				consecutive = false;
-			pend = ei->e.pstart + ei->e.plen;
-			device_id = ei->e.device_id;
 		}
 
 		if (!raw) {
@@ -2595,21 +2585,61 @@ int z_erofs_rebuild_load_metadata(struct erofs_sb_info *dst_sbi,
 			}
 		}
 		init_list_head(&ei->list);
-		list_add_tail(&ei->list, &extents);
+		list_add_tail(&ei->list, extents);
 		map.m_la += map.m_llen;
 	}
-	inode->z_lclusterbits = sbi->blkszbits;
-	err = z_erofs_prepare_layout(inode, &extents, consecutive, false);
-	if (err)
-		goto err_out;
-	return 0;
+	err = 0;
+	goto out;
 
 err_free_ei:
 	free(ei);
-err_out:
-	list_for_each_entry_safe(ei, n, &extents, list) {
+	free(inode->idata);
+	inode->idata = NULL;
+out:
+	erofs_put_metabuf(&map.buf);
+	return err;
+}
+
+static void z_erofs_rebuild_free_extents(struct list_head *extents)
+{
+	struct z_erofs_extent_item *ei, *n;
+
+	list_for_each_entry_safe(ei, n, extents, list) {
 		list_del(&ei->list);
 		free(ei);
 	}
+}
+
+int z_erofs_rebuild_load_metadata(struct erofs_sb_info *dst_sbi,
+				  struct erofs_inode *inode)
+{
+	struct z_erofs_extent_item *ei;
+	erofs_off_t pend = EROFS_NULL_ADDR;
+	bool consecutive = true;
+	LIST_HEAD(extents);
+	int err, device_id = -1;
+
+	err = z_erofs_rebuild_load_extents(dst_sbi, inode, &extents);
+	if (err)
+		goto out;
+
+	/* Translate source mappings into references to the external image. */
+	list_for_each_entry(ei, &extents, list) {
+		if (ei->e.inlined) {
+			ei->e.pstart = pend != EROFS_NULL_ADDR ? pend : 0;
+		} else {
+			if (pend != EROFS_NULL_ADDR &&
+			    (pend != ei->e.pstart || device_id != ei->e.device_id))
+				consecutive = false;
+			pend = ei->e.pstart + ei->e.plen;
+			device_id = ei->e.device_id;
+		}
+		ei->e.device_id = inode->dev; /* FIXME: remap source devices. */
+	}
+	inode->z_lclusterbits = inode->sbi->blkszbits;
+	err = z_erofs_prepare_layout(inode, &extents, consecutive, false);
+out:
+	if (err)
+		z_erofs_rebuild_free_extents(&extents);
 	return err;
 }
