@@ -10,6 +10,11 @@ enum erofs_rebuild_datamode {
 	EROFS_REBUILD_DATA_FULL,
 };
 
+int z_erofs_rebuild_load_metadata(struct erofs_sb_info *dst,
+				 struct erofs_inode *inode);
+int z_erofs_rebuild_write_full_data(struct erofs_sb_info *dst,
+				   struct erofs_inode *inode);
+
 struct erofs_dentry *erofs_rebuild_get_dentry(struct erofs_inode *pwd,
 		char *path, bool aufs, bool *whout, bool *opq, bool to_head);
 

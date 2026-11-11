@@ -26,6 +26,7 @@
 #include "liberofs_compress.h"
 #include "liberofs_fragments.h"
 #include "liberofs_metabox.h"
+#include "liberofs_rebuild.h"
 #include "erofs/decompress.h"
 
 #define Z_EROFS_DESTBUF_SZ	(Z_EROFS_PCLUSTER_MAX_SIZE + EROFS_MAX_BLOCK_SIZE * 2)
@@ -2496,6 +2497,58 @@ int z_erofs_compress_exit(struct erofs_sb_info *sbi)
 	return 0;
 }
 
+static int z_erofs_rebuild_copy_data(struct erofs_sb_info *dst,
+		struct erofs_inode *inode, struct list_head *extents)
+{
+	struct erofs_sb_info *src = inode->sbi;
+	struct erofs_buffer_head *bh = NULL;
+	struct z_erofs_extent_item *ei;
+	erofs_off_t total = 0, pos = 0;
+	unsigned int bs = erofs_blksiz(dst);
+	int err = 0;
+
+	list_for_each_entry(ei, extents, list)
+		if (!ei->e.inlined)
+			total += round_up(ei->e.plen, bs);
+	if (total) {
+		bh = erofs_balloc(dst->bmgr, DATA, total, 0);
+		if (IS_ERR(bh))
+			return PTR_ERR(bh);
+		erofs_mapbh(NULL, bh->block);
+		pos = erofs_btell(bh, false);
+	}
+
+	list_for_each_entry(ei, extents, list) {
+		erofs_off_t off;
+
+		if (!ei->e.inlined) {
+			for (off = 0; off < ei->e.plen; off += bs) {
+				char buf[EROFS_MAX_BLOCK_SIZE] = {};
+				unsigned int len = min_t(u64, bs, ei->e.plen - off);
+
+				err = erofs_dev_read(src, ei->e.device_id, buf,
+						     ei->e.pstart + off, len);
+				if (err)
+					goto out;
+				err = erofs_dev_write(dst, 0, buf, pos + off, bs);
+				if (err)
+					goto out;
+			}
+		}
+		ei->e.pstart = pos;
+		ei->e.device_id = 0;
+		if (!ei->e.inlined)
+			pos += round_up(ei->e.plen, bs);
+	}
+	inode->u.i_blocks = erofs_blknr(dst, total);
+	erofs_dbg("copied compressed data for %s (%llu bytes)",
+		  inode->i_srcpath, total | 0ULL);
+out:
+	if (bh)
+		erofs_bdrop(bh, !!err);
+	return err;
+}
+
 static int z_erofs_rebuild_load_extents(struct erofs_sb_info *dst_sbi,
 		struct erofs_inode *inode, struct list_head *extents)
 {
@@ -2638,6 +2691,55 @@ int z_erofs_rebuild_load_metadata(struct erofs_sb_info *dst_sbi,
 	}
 	inode->z_lclusterbits = inode->sbi->blkszbits;
 	err = z_erofs_prepare_layout(inode, &extents, consecutive, false);
+out:
+	if (err)
+		z_erofs_rebuild_free_extents(&extents);
+	return err;
+}
+
+int z_erofs_rebuild_write_full_data(struct erofs_sb_info *dst_sbi,
+				   struct erofs_inode *inode)
+{
+	struct erofs_sb_info *src_sbi = inode->sbi;
+	struct z_erofs_extent_item *ei;
+	unsigned int algs = 0;
+	bool partial = false;
+	LIST_HEAD(extents);
+	int err;
+
+	err = z_erofs_rebuild_load_extents(dst_sbi, inode, &extents);
+	if (err)
+		goto out;
+	list_for_each_entry(ei, &extents, list) {
+		if (!ei->e.raw)
+			algs |= BIT(ei->e.algofmt);
+		partial |= ei->e.partial;
+	}
+	/* The lcluster-index layout can describe at most two algorithms. */
+	inode->z_algorithmtype[0] = algs ? ffs_long(algs) : 0;
+	algs &= algs - 1;
+	inode->z_algorithmtype[1] = algs ? ffs_long(algs) : 0;
+	algs &= algs - 1;
+	if (algs) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+	err = z_erofs_rebuild_copy_data(dst_sbi, inode, &extents);
+	if (err)
+		goto out;
+	inode->z_advise &= Z_EROFS_ADVISE_INTERLACED_PCLUSTER;
+	inode->fragment_size = 0;
+	inode->fragmentoff = 0;
+	if (partial)
+		erofs_sb_set_dedupe(dst_sbi);
+	if (inode->idata_size) {
+		inode->z_advise |= Z_EROFS_ADVISE_INLINE_PCLUSTER;
+		erofs_sb_set_ztailpacking(dst_sbi);
+	}
+	inode->sbi = dst_sbi;
+	inode->z_lclusterbits = dst_sbi->blkszbits;
+	err = z_erofs_prepare_layout(inode, &extents, !partial, false);
+	inode->sbi = src_sbi;
 out:
 	if (err)
 		z_erofs_rebuild_free_extents(&extents);

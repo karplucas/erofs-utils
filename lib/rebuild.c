@@ -289,15 +289,13 @@ err:
 static int erofs_rebuild_write_blob_index(struct erofs_sb_info *dst_sb,
 					  struct erofs_inode *inode)
 {
-	int z_erofs_rebuild_load_metadata(struct erofs_sb_info *dst_sb,
-					  struct erofs_inode *inode);
-
 	if (is_inode_layout_compression(inode))
 		return z_erofs_rebuild_load_metadata(dst_sb, inode);
 	return erofs_rebuild_load_chunk_index(dst_sb, inode);
 }
 
-static int erofs_rebuild_write_full_data(struct erofs_inode *inode)
+static int erofs_rebuild_write_full_data(struct erofs_sb_info *dst_sbi,
+					struct erofs_inode *inode)
 {
 	struct erofs_sb_info *src_sbi = inode->sbi;
 	int err = 0;
@@ -357,9 +355,7 @@ static int erofs_rebuild_write_full_data(struct erofs_inode *inode)
 			  inode->i_srcpath);
 		err = -EOPNOTSUPP;
 	} else if (is_inode_layout_compression(inode)) {
-		erofs_err("compressed files not yet supported: %s",
-			  inode->i_srcpath);
-		err = -EOPNOTSUPP;
+		err = z_erofs_rebuild_write_full_data(dst_sbi, inode);
 	}
 	return err;
 }
@@ -410,7 +406,7 @@ static int erofs_rebuild_update_inode(struct erofs_sb_info *dst_sb,
 		else if (datamode == EROFS_REBUILD_DATA_RESVSP)
 			inode->datasource = EROFS_INODE_DATA_SOURCE_RESVSP;
 		else if (datamode == EROFS_REBUILD_DATA_FULL)
-			err = erofs_rebuild_write_full_data(inode);
+			err = erofs_rebuild_write_full_data(dst_sb, inode);
 		else
 			err = -EOPNOTSUPP;
 		break;
@@ -593,7 +589,7 @@ int erofs_rebuild_load_tree(struct erofs_inode *root, struct erofs_sb_info *sbi,
 		return ret;
 	}
 
-	if (mode == EROFS_REBUILD_DATA_BLOB_INDEX) {
+	if (mode != EROFS_REBUILD_DATA_RESVSP) {
 		if (erofs_sb_has_ztailpacking(sbi))
 			erofs_sb_set_ztailpacking(dst_sbi);
 		if (erofs_sb_has_dedupe(sbi))

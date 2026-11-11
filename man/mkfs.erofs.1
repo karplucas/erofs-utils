@@ -525,6 +525,10 @@ image layers.
 \fB\-\-clean=data\fR: Import complete file data from all source images into
 the destination image, producing a fully self-contained EROFS image that does
 not depend on external blob devices.
+Compressed file data is copied without decompression or recompression.
+As with blob-index rebuilds, specify destination compression settings
+compatible with the source images, such as the same \fB\-z\fR and \fB\-C\fR
+options used to create them. Fragment-backed files are not supported.
 .TP
 .I rvsp mode
 \fB\-\-clean=rvsp\fR or \fB\-\-incremental=rvsp\fR: Reserve space for file
